@@ -1,0 +1,101 @@
+@{
+    ViewData["Title"] = "Upload ke Cloudflare R2";
+    var files = (List<FileItemViewModel>)ViewBag.R2Files;
+    var configured = (bool)ViewBag.R2Configured;
+    var listError = ViewBag.R2ListError as string;
+}
+
+<div class="row justify-content-center">
+    <div class="col-lg-9">
+        <h1 class="h3 mb-1">☁️ Upload File ke Cloudflare R2</h1>
+        <p class="text-muted mb-4">Sample upload file ke Cloudflare R2 (S3-compatible object storage) menggunakan AWS SDK for .NET.</p>
+
+        @if (!configured)
+        {
+            <div class="alert alert-warning">
+                <strong>Konfigurasi R2 belum lengkap.</strong> Isi nilai berikut di <code>appsettings.json</code> atau via
+                <code>dotnet user-secrets</code>:
+                <ul class="mb-0 mt-2">
+                    <li><code>R2:AccountId</code> — Cloudflare Account ID</li>
+                    <li><code>R2:AccessKeyId</code> — R2 Access Key ID</li>
+                    <li><code>R2:SecretAccessKey</code> — R2 Secret Access Key</li>
+                    <li><code>R2:BucketName</code> — nama bucket R2</li>
+                    <li><code>R2:PublicBaseUrl</code> — <em>(opsional)</em> base URL publik bucket, mis. <code>https://pub-xxxx.r2.dev</code></li>
+                </ul>
+            </div>
+        }
+
+        <div asp-validation-summary="ModelOnly" class="text-danger mb-3"></div>
+
+        @if (ViewBag.UploadedKey != null)
+        {
+            <div class="alert alert-success">
+                <strong>✅ Upload berhasil!</strong>
+                Key: <code>@ViewBag.UploadedKey</code>
+                <span class="badge text-bg-secondary ms-1">@ViewBag.UploadedSizeText</span>
+            </div>
+        }
+
+        <form asp-action="R2" method="post" enctype="multipart/form-data" class="card shadow-sm mb-4">
+            <div class="card-body">
+                <div class="mb-3">
+                    <label for="file" class="form-label fw-semibold">Pilih file</label>
+                    <input type="file" class="form-control" id="file" name="file" required />
+                    <div class="form-text">File akan disimpan ke bucket R2 dengan key prefix <code>uploads/yyyy/MM/dd/</code>. Maksimal 100 MB.</div>
+                </div>
+                <button type="submit" class="btn btn-primary">
+                    ⬆️ Upload ke R2
+                </button>
+            </div>
+        </form>
+
+        <div class="card shadow-sm">
+            <div class="card-header bg-white fw-semibold">📄 File di bucket R2 (@files.Count)</div>
+            <div class="card-body p-0">
+                @if (listError != null)
+                {
+                    <div class="alert alert-danger m-3 mb-0">
+                        Gagal mengambil daftar file: <code>@listError</code>
+                    </div>
+                }
+                else if (files.Count == 0)
+                {
+                    <p class="text-muted m-3 mb-0">Belum ada file terupload.</p>
+                }
+                else
+                {
+                    <div class="table-responsive">
+                        <table class="table table-striped table-hover align-middle mb-0">
+                            <thead>
+                                <tr>
+                                    <th>Key</th>
+                                    <th style="width:110px">Ukuran</th>
+                                    <th style="width:180px">Terakhir Diubah</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                @foreach (var f in files)
+                                {
+                                    <tr>
+                                        <td class="text-break">
+                                            @if (f.Url != null)
+                                            {
+                                                <a href="@f.Url" target="_blank" rel="noopener">@f.Name</a>
+                                            }
+                                            else
+                                            {
+                                                @f.Name
+                                            }
+                                        </td>
+                                        <td>@f.SizeText</td>
+                                        <td>@f.LastModified.ToLocalTime().ToString("dd MMM yyyy HH:mm:ss")</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+            </div>
+        </div>
+    </div>
+</div>
