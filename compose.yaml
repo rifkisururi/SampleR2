@@ -1,0 +1,45 @@
+# Jalankan 4 container SampleR2 dalam 1 server.
+# Pemakaian:
+#   docker compose up -d      → jalankan 4 container
+#   docker compose ps         → lihat status
+#   docker compose logs -f    → log gabungan
+#   docker compose down       → stop & hapus
+# Konfigurasi (DB + R2) dibaca dari file sampler2.env — JANGAN di-commit.
+#
+# Catatan port: 8082 dipakai aplikasi lain (jira-weekly-rifki), jadi sampler2-2 memakai 8085.
+
+x-sampler2: &sampler2
+  image: rifkisururi/sampler2:latest
+  restart: unless-stopped
+  env_file: sampler2.env
+  volumes:
+    # 4 container share folder upload yang sama (produk_local konsisten antar instance)
+    - uploads:/app/wwwroot/uploads
+
+services:
+  sampler2-1:
+    <<: *sampler2
+    container_name: sampler2-1
+    ports:
+      - "8081:8080"
+
+  sampler2-2:
+    <<: *sampler2
+    container_name: sampler2-2
+    ports:
+      - "8085:8080"
+
+  sampler2-3:
+    <<: *sampler2
+    container_name: sampler2-3
+    ports:
+      - "8083:8080"
+
+  sampler2-4:
+    <<: *sampler2
+    container_name: sampler2-4
+    ports:
+      - "8084:8080"
+
+volumes:
+  uploads:

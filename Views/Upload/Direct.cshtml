@@ -1,0 +1,314 @@
+@{
+    ViewData["Title"] = "Upload Langsung ke R2 (Browser)";
+    var configured = (bool)ViewBag.DirectConfigured;
+    var maxSizeText = (string)ViewBag.DirectMaxSizeText;
+}
+
+<style>
+    .dropzone {
+        border: 2px dashed #adb5bd;
+        border-radius: .5rem;
+        padding: 2.5rem 1rem;
+        text-align: center;
+        cursor: pointer;
+        transition: border-color .15s ease-in-out, background-color .15s ease-in-out;
+    }
+
+    .dropzone:hover, .dropzone:focus-visible {
+        border-color: #0d6efd;
+        outline: none;
+    }
+
+    .dropzone.dragover {
+        border-color: #0d6efd;
+        background-color: #f0f6ff;
+    }
+
+    .preview-img {
+        max-height: 240px;
+        max-width: 100%;
+        border-radius: .375rem;
+    }
+
+    .result-thumb {
+        height: 56px;
+        width: 56px;
+        object-fit: cover;
+        border-radius: .25rem;
+        border: 1px solid #dee2e6;
+    }
+</style>
+
+<div class="row justify-content-center">
+    <div class="col-lg-9">
+        <h1 class="h3 mb-1">🚀 Upload Langsung ke Cloudflare R2 (dari Browser)</h1>
+        <p class="text-muted mb-4">
+            Gambar diupload <strong>langsung dari browser ke Cloudflare R2</strong> memakai <em>presigned URL</em> —
+            byte file tidak pernah melewati backend. Backend hanya menerbitkan URL berumur pendek, sehingga
+            secret key tidak pernah tampil di browser.
+        </p>
+
+        @if (!configured)
+        {
+            <div class="alert alert-warning">
+                <strong>Konfigurasi R2 belum lengkap.</strong> Isi <code>R2:*</code> di <code>appsettings.json</code>
+                atau via <code>dotnet user-secrets</code> — lihat halaman <a asp-controller="Upload" asp-action="R2">Upload R2</a>.
+            </div>
+        }
+
+        <div class="alert alert-info">
+            <strong>Persyaratan sekali setup:</strong> bucket R2 harus mengizinkan <code>PUT</code> dari origin
+            aplikasi ini (CORS). Isi di dashboard Cloudflare → R2 → bucket → <em>Settings</em> → <em>CORS policy</em>:
+            <pre class="mb-2 mt-2"><code>[
+  {
+    "AllowedOrigins": ["http://localhost:5000", "http://localhost:5001", "https://domain-anda.com"],
+    "AllowedMethods": ["GET", "PUT"],
+    "AllowedHeaders": ["content-type"],
+    "MaxAgeSeconds": 3600
+  }
+]</code></pre>
+            <small class="text-muted d-block">Sesuaikan <code>AllowedOrigins</code> dengan origin aplikasi. Tanpa ini, browser akan menolak request PUT ke R2.</small>
+        </div>
+
+        <form id="direct-form" class="card shadow-sm mb-4">
+            @Html.AntiForgeryToken()
+            <div class="card-body">
+                <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="Klik atau seret gambar ke sini">
+                    <input type="file" id="file-input" hidden accept="image/jpeg,image/png,image/gif,image/webp,image/avif" />
+                    <div id="dropzone-empty">
+                        🖼️ <strong>Klik untuk memilih gambar</strong> atau seret &amp; letakkan di sini<br />
+                        <small class="text-muted">JPG, PNG, GIF, WebP, AVIF — maksimal @maxSizeText</small>
+                    </div>
+                    <img id="preview" alt="Preview gambar" class="preview-img" hidden />
+                </div>
+                <div id="file-meta" class="small text-muted mt-2" hidden></div>
+
+                <div id="progress-wrap" class="progress mt-3" style="height: 20px;" hidden>
+                    <div id="progress-bar" class="progress-bar progress-bar-striped" role="progressbar" style="width: 0%">0%</div>
+                </div>
+
+                <div id="error-box" class="alert alert-danger mt-3 mb-0" hidden></div>
+
+                <button type="submit" id="btn-upload" class="btn btn-primary mt-3" disabled>⬆️ Upload langsung ke R2</button>
+            </div>
+        </form>
+
+        <div class="card shadow-sm" id="results-card" hidden>
+            <div class="card-header bg-white fw-semibold">✅ Hasil upload sesi ini (<span id="results-count">0</span>)</div>
+            <div class="card-body p-0">
+                <ul id="results-list" class="list-group list-group-flush"></ul>
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script>
+        (() => {
+            const MAX_BYTES = @(ViewBag.DirectMaxBytes);
+            const MAX_TEXT = @Html.Raw(Json.Serialize(maxSizeText));
+
+            const form = document.getElementById('direct-form');
+            const tokenInput = form.querySelector('input[name="__RequestVerificationToken"]');
+            const input = document.getElementById('file-input');
+            const dropzone = document.getElementById('dropzone');
+            const dropzoneEmpty = document.getElementById('dropzone-empty');
+            const preview = document.getElementById('preview');
+            const fileMeta = document.getElementById('file-meta');
+            const progressWrap = document.getElementById('progress-wrap');
+            const progressBar = document.getElementById('progress-bar');
+            const errorBox = document.getElementById('error-box');
+            const btn = document.getElementById('btn-upload');
+            const resultsCard = document.getElementById('results-card');
+            const resultsList = document.getElementById('results-list');
+            const resultsCount = document.getElementById('results-count');
+
+            let selectedFile = null;
+
+            // ==================== Validasi FE ====================
+
+            const startsWith = (bytes, signature) => signature.every((b, i) => bytes[i] === b);
+
+            function readMagicBytes(file) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(new Uint8Array(reader.result));
+                    reader.onerror = () => reject(new Error('Gagal membaca file.'));
+                    reader.readAsArrayBuffer(file.slice(0, 16));
+                });
+            }
+
+            // Magic bytes dicek di FE (UX): menolak file yang bukan gambar sebelum mengupload.
+            async function validateImage(file) {
+                if (file.size <= 0) return 'File kosong.';
+                if (file.size > MAX_BYTES) return `Ukuran maksimal ${MAX_TEXT}.`;
+
+                const bytes = await readMagicBytes(file);
+                if (startsWith(bytes, [0xFF, 0xD8, 0xFF])) return null;                                    // JPEG
+                if (startsWith(bytes, [0x89, 0x50, 0x4E, 0x47])) return null;                              // PNG
+                if (startsWith(bytes, [0x47, 0x49, 0x46, 0x38])) return null;                              // GIF8
+                if (startsWith(bytes, [0x52, 0x49, 0x46, 0x46]) &&
+                    startsWith(bytes.slice(8), [0x57, 0x45, 0x42, 0x50])) return null;                     // WebP
+                if (startsWith(bytes, [0x66, 0x74, 0x79, 0x70])) {                                         // ISO-BMFF "ftyp"
+                    const brand = String.fromCharCode(...bytes.slice(8, 12)).toLowerCase();
+                    if (brand.startsWith('av')) return null;                                               // AVIF / AVIS
+                }
+                return 'Isi file tidak dikenali sebagai gambar yang diizinkan.';
+            }
+
+            // ==================== Pilih / seret file ====================
+
+            async function selectFile(file) {
+                showError(null);
+                if (!file) return;
+
+                const validationError = await validateImage(file);
+                if (validationError) {
+                    showError(validationError);
+                    clearFile();
+                    return;
+                }
+
+                selectedFile = file;
+                preview.src = URL.createObjectURL(file);
+                preview.hidden = false;
+                dropzoneEmpty.hidden = true;
+                fileMeta.textContent = `${file.name} • ${formatSize(file.size)}`;
+                fileMeta.hidden = false;
+                btn.disabled = false;
+            }
+
+            function clearFile() {
+                selectedFile = null;
+                input.value = '';
+                preview.hidden = true;
+                preview.removeAttribute('src');
+                dropzoneEmpty.hidden = false;
+                fileMeta.hidden = true;
+                btn.disabled = true;
+            }
+
+            dropzone.addEventListener('click', () => input.click());
+            dropzone.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); input.click(); }
+            });
+            input.addEventListener('change', () => selectFile(input.files[0]));
+
+            ['dragenter', 'dragover'].forEach((type) =>
+                dropzone.addEventListener(type, (e) => { e.preventDefault(); dropzone.classList.add('dragover'); }));
+            ['dragleave', 'drop'].forEach((type) =>
+                dropzone.addEventListener(type, (e) => { e.preventDefault(); dropzone.classList.remove('dragover'); }));
+            dropzone.addEventListener('drop', (e) => selectFile(e.dataTransfer.files[0]));
+
+            // ==================== Presign + upload langsung ke R2 ====================
+
+            async function getPresignedUrl(file) {
+                const res = await fetch('@Url.Action("PresignDirect", "Upload")', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'RequestVerificationToken': tokenInput.value,
+                    },
+                    body: JSON.stringify({ fileName: file.name, size: file.size }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || `Gagal minta presigned URL (HTTP ${res.status}).`);
+                return data;
+            }
+
+            // XHR (bukan fetch) supaya bisa menampilkan progress upload.
+            function uploadToR2(url, contentType, file) {
+                return new Promise((resolve, reject) => {
+                    const xhr = new XMLHttpRequest();
+                    xhr.open('PUT', url);
+                    xhr.setRequestHeader('Content-Type', contentType);
+                    xhr.upload.addEventListener('progress', (e) => {
+                        if (e.lengthComputable) setProgress(Math.round((e.loaded / e.total) * 100));
+                    });
+                    xhr.addEventListener('load', () =>
+                        xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`R2 menolak upload (HTTP ${xhr.status}).`)));
+                    xhr.addEventListener('error', () =>
+                        reject(new Error('Koneksi ke R2 gagal. Pastikan CORS bucket sudah diisi (lihat catatan di atas).')));
+                    xhr.addEventListener('abort', () => reject(new Error('Upload dibatalkan.')));
+                    xhr.send(file);
+                });
+            }
+
+            form.addEventListener('submit', async (e) => {
+                e.preventDefault();
+                if (!selectedFile || btn.disabled) return;
+
+                showError(null);
+                setProgress(0);
+                progressWrap.hidden = false;
+                progressBar.classList.add('progress-bar-animated');
+                btn.disabled = true;
+
+                try {
+                    const presign = await getPresignedUrl(selectedFile);
+                    await uploadToR2(presign.url, presign.contentType, selectedFile);
+                    addResult(presign, selectedFile);
+                    setProgress(100);
+                    clearFile();
+                } catch (err) {
+                    showError(err.message);
+                } finally {
+                    progressWrap.hidden = true;
+                    progressBar.classList.remove('progress-bar-animated');
+                    if (selectedFile) btn.disabled = false;
+                }
+            });
+
+            // ==================== Util UI ====================
+
+            function setProgress(percent) {
+                progressBar.style.width = percent + '%';
+                progressBar.textContent = percent + '%';
+                progressBar.setAttribute('aria-valuenow', percent);
+            }
+
+            function showError(message) {
+                errorBox.hidden = message === null;
+                errorBox.textContent = message ?? '';
+            }
+
+            function formatSize(bytes) {
+                if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + ' MB';
+                if (bytes >= 1024) return (bytes / 1024).toFixed(2) + ' KB';
+                return bytes + ' B';
+            }
+
+            function addResult(presign, file) {
+                const li = document.createElement('li');
+                li.className = 'list-group-item d-flex align-items-center gap-3';
+
+                const img = document.createElement('img');
+                img.className = 'result-thumb';
+                img.alt = presign.key;
+                img.src = URL.createObjectURL(file);
+
+                const body = document.createElement('div');
+                body.className = 'flex-grow-1 text-break';
+                const keyDiv = document.createElement('div');
+                keyDiv.textContent = presign.key;
+                const sizeDiv = document.createElement('div');
+                sizeDiv.className = 'small text-muted';
+                sizeDiv.textContent = `${formatSize(file.size)} • ${presign.contentType}`;
+                body.append(keyDiv, sizeDiv);
+
+                const link = document.createElement('a');
+                link.href = presign.publicUrl ?? presign.viewUrl;
+                link.target = '_blank';
+                link.rel = 'noopener';
+                link.className = 'btn btn-sm btn-outline-primary flex-shrink-0';
+                link.textContent = presign.publicUrl ? 'Buka' : 'Lihat (sementara)';
+
+                li.append(img, body, link);
+                resultsList.prepend(li);
+
+                resultsCount.textContent = resultsList.children.length;
+                resultsCard.hidden = false;
+            }
+        })();
+    </script>
+}

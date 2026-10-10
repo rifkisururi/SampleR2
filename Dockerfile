@@ -25,6 +25,12 @@ RUN dotnet publish "./SampleR2.csproj" -c $BUILD_CONFIGURATION -o /app/publish /
 
 # This stage is used in production or when running from VS in regular mode (Default when not using the Debug configuration)
 FROM base AS final
+# COPY harus sebagai root; setelah itu siapkan folder writable untuk upload
+# local storage & benchmark, lalu kembali ke user non-root ($APP_UID).
+USER root
 WORKDIR /app
 COPY --from=publish /app/publish .
+RUN mkdir -p /app/wwwroot/uploads/produk /app/wwwroot/uploads-benchmark \
+    && chown -R $APP_UID:$APP_UID /app/wwwroot
+USER $APP_UID
 ENTRYPOINT ["dotnet", "SampleR2.dll"]

@@ -1,0 +1,346 @@
+@model BenchmarkViewModel
+@{
+    ViewData["Title"] = "Benchmark Upload";
+}
+
+<div class="row justify-content-center">
+    <div class="col-lg-10">
+        <h1 class="h3 mb-1">🏁 Benchmark Upload: wwwroot vs R2 (server) vs R2 (browser)</h1>
+        <p class="text-muted mb-4">
+            Pilih <strong>1 file asli</strong>, lalu jalankan benchmark per target — file tersebut diupload
+            berulang sebanyak jumlah putaran yang disetel: tulis ke wwwroot, upload ke R2 lewat server,
+            atau upload langsung dari browser ke R2 (presigned URL). Setiap target menjalankan 1 iterasi
+            warmup (tidak dihitung). Semua file hasil benchmark dibersihkan otomatis.
+        </p>
+
+        @if (!Model.R2Configured)
+        {
+            <div class="alert alert-warning">
+                R2 belum dikonfigurasi — target <em>R2 (server)</em> dan <em>R2 (browser)</em> tidak bisa dijalankan.
+                Lengkapi <code>R2:*</code> di appsettings / env var (lihat halaman <a asp-controller="Upload" asp-action="R2">Upload R2</a>).
+            </div>
+        }
+
+        <form id="bench-form" class="card shadow-sm mb-4" onsubmit="return false;">
+            @Html.AntiForgeryToken()
+            <div class="card-body">
+                <div class="row g-3">
+                    <div class="col-md-6">
+                        <label for="bench-file" class="form-label fw-semibold">File untuk dibenchmark</label>
+                        <input type="file" class="form-control" id="bench-file" required />
+                        <div class="form-text">File asli ini yang diupload berulang. Maksimal 5 GB (batas single PUT R2).</div>
+                    </div>
+                    <div class="col-6 col-md-3">
+                        <label for="iterations" class="form-label fw-semibold">Jumlah putaran</label>
+                        <input type="number" class="form-control" id="iterations"
+                               value="@Model.Iterations" min="1" max="100" required />
+                        <div class="form-text">1–100 per target.</div>
+                    </div>
+                </div>
+
+                <div class="d-flex flex-wrap gap-2 mt-3">
+                    <button type="button" class="btn btn-primary bench-btn" data-target="wwwroot">💾 Benchmark wwwroot</button>
+                    <button type="button" class="btn btn-primary bench-btn" data-target="r2">☁️ Benchmark R2 (via server)</button>
+                    <button type="button" class="btn btn-outline-primary bench-btn" data-target="fe">🚀 Benchmark R2 (langsung dari browser)</button>
+                </div>
+                <div class="small text-muted mt-2" id="bench-status"></div>
+                <div class="text-danger small mt-1" id="bench-error"></div>
+            </div>
+        </form>
+
+        <div class="card shadow-sm" id="result-card" hidden>
+            <div class="card-header bg-white">
+                <span class="fw-semibold">📊 Hasil</span>
+                <span id="result-summary" class="text-muted"></span>
+            </div>
+            <div class="card-body p-0">
+                <div class="table-responsive">
+                    <table class="table table-striped align-middle mb-0">
+                        <thead>
+                            <tr>
+                                <th>Target</th>
+                                <th>Sukses/Gagal</th>
+                                <th class="text-end">Min</th>
+                                <th class="text-end">Rata-rata</th>
+                                <th class="text-end">Median</th>
+                                <th class="text-end">Maks</th>
+                                <th class="text-end">Total</th>
+                                <th class="text-end">Throughput</th>
+                            </tr>
+                        </thead>
+                        <tbody id="result-tbody"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card-footer text-muted small">
+                Total = jumlah waktu semua putaran (warmup tidak dihitung). Throughput = total data ÷ total waktu.
+                Target server diukur dari sisi aplikasi; target browser diukur di browser Anda (presign + PUT).
+            </div>
+        </div>
+    </div>
+</div>
+
+@section Scripts {
+    <script>
+        (() => {
+            const form = document.getElementById('bench-form');
+            const tokenInput = form.querySelector('input[name="__RequestVerificationToken"]');
+            const status = document.getElementById('bench-status');
+            const errorBox = document.getElementById('bench-error');
+            const resultCard = document.getElementById('result-card');
+            const tbody = document.getElementById('result-tbody');
+            const summary = document.getElementById('result-summary');
+            const buttons = form.querySelectorAll('.bench-btn');
+
+            let running = false;
+
+            const LABELS = { wwwroot: 'wwwroot', r2: 'R2 (via server)', fe: 'R2 (langsung dari browser)' };
+            const fmtMs = (v) => Number(v).toLocaleString('id-ID', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + ' ms';
+            const fmtPlain = (v, suffix, digits) =>
+                Number(v).toLocaleString('id-ID', { minimumFractionDigits: digits, maximumFractionDigits: digits }) + ' ' + suffix;
+            const fmtSize = (b) =>
+                b >= 1073741824 ? (b / 1073741824).toFixed(2) + ' GB'
+                : b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
+                : (b / 1024).toFixed(0) + ' KB';
+
+            // Logging tiap tahap benchmark ke DevTools console (buka dengan F12 → Console).
+            const log = (...a) => console.log('%c[Bench]', 'color:#0d6efd;font-weight:bold', ...a);
+            const logErr = (...a) => console.error('[Bench]', ...a);
+
+            function readParams() {
+                // Server meng-clamp juga; di sini cukup fallback nilai default.
+                let iterations = parseInt(document.getElementById('iterations').value, 10);
+                if (!Number.isInteger(iterations)) iterations = 10;
+                const file = document.getElementById('bench-file').files[0];
+                return { iterations, file };
+            }
+
+            function setRunning(value, label) {
+                running = value;
+                buttons.forEach((b) => (b.disabled = value));
+                status.textContent = label ?? '';
+            }
+
+            function escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            function updateBestBadge() {
+                let bestTr = null;
+                let bestValue = 0;
+
+                tbody.querySelectorAll('tr').forEach((tr) => {
+                    tr.querySelector('.badge')?.remove();
+                    const value = parseFloat(tr.dataset.throughput || '0');
+                    if (value > bestValue) { bestValue = value; bestTr = tr; }
+                });
+
+                if (bestTr && bestValue > 0) {
+                    const badge = document.createElement('span');
+                    badge.className = 'badge text-bg-success ms-1';
+                    badge.textContent = 'tercepat';
+                    bestTr.querySelector('td').appendChild(badge);
+                }
+            }
+
+            function renderRow(row, isFe) {
+                resultCard.hidden = false;
+
+                const tr = document.createElement('tr');
+                if (isFe) tr.className = 'table-info';
+                tr.dataset.throughput = row.throughputMBps ?? '0';
+
+                tr.innerHTML = `
+                    <td><strong>${escapeHtml(row.target)}</strong>
+                        ${isFe ? '<div class="small text-muted">diukur di browser Anda: presign + PUT</div>' : ''}
+                        ${row.firstError ? `<div class="text-danger small mt-1">Error pertama: ${escapeHtml(row.firstError)}</div>` : ''}</td>
+                    <td>${row.success} / ${row.failed}</td>
+                    <td class="text-end">${fmtMs(row.minMs)}</td>
+                    <td class="text-end">${fmtMs(row.avgMs)}</td>
+                    <td class="text-end">${fmtMs(row.medianMs)}</td>
+                    <td class="text-end">${fmtMs(row.maxMs)}</td>
+                    <td class="text-end">${fmtPlain(row.totalSeconds, 's', 2)}</td>
+                    <td class="text-end">${fmtPlain(row.throughputMBps, 'MB/s', 2)}</td>`;
+                tbody.appendChild(tr);
+
+                summary.textContent = `— ${tbody.children.length} target sudah diukur`;
+                updateBestBadge();
+            }
+
+            async function fetchJson(url, body) {
+                const res = await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'RequestVerificationToken': tokenInput.value },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || `Permintaan gagal (HTTP ${res.status}).`);
+                return data;
+            }
+
+            // ==================== Target server-side: wwwroot / r2 (multipart, file asli) ====================
+
+            async function runServerTarget(target) {
+                const { iterations, file } = readParams();
+                const fd = new FormData();
+                fd.append('target', target);
+                fd.append('iterations', iterations);
+                fd.append('file', file);
+
+                const res = await fetch('@Url.Action("RunTarget", "Benchmark")', {
+                    method: 'POST',
+                    headers: { 'RequestVerificationToken': tokenInput.value },
+                    body: fd, // multipart/form-data — jangan set Content-Type manual
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || `Permintaan gagal (HTTP ${res.status}).`);
+                renderRow(data, false);
+            }
+
+            // ==================== Target browser: R2 langsung dari FE (file asli) ====================
+
+            async function presign(file) {
+                const body = {
+                    sizeBytes: file.size,
+                    fileName: file.name,
+                    contentType: file.type || 'application/octet-stream',
+                };
+                log('TAHAP presign: minta presigned URL ke backend…', body);
+                const t0 = performance.now();
+                const res = await fetch('@Url.Action("PresignBenchmark", "Benchmark")', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'RequestVerificationToken': tokenInput.value },
+                    body: JSON.stringify(body),
+                });
+                const data = await res.json().catch(() => ({}));
+                log(`TAHAP presign: respons HTTP ${res.status} dalam ${(performance.now() - t0).toFixed(0)} ms`);
+                if (!res.ok) {
+                    logErr('TAHAP presign GAGAL:', data);
+                    throw new Error(data.error || `Gagal minta presigned URL (HTTP ${res.status}).`);
+                }
+                log('TAHAP presign: OK —', { key: data.key, contentType: data.contentType, url: data.url.slice(0, 90) + '…' });
+                return data;
+            }
+
+            async function putToR2(url, contentType, file) {
+                log(`TAHAP PUT: kirim "${file.name}" (${fmtSize(file.size)}) langsung ke R2 dengan Content-Type: ${contentType}`);
+                const t0 = performance.now();
+                const res = await fetch(url, { method: 'PUT', headers: { 'Content-Type': contentType }, body: file });
+                const ms = (performance.now() - t0).toFixed(0);
+                if (!res.ok) {
+                    const errBody = await res.text().catch(() => '');
+                    logErr(`TAHAP PUT GAGAL: HTTP ${res.status} setelah ${ms} ms —`, { statusText: res.statusText, bodyR2: errBody.slice(0, 500) });
+                    throw new Error(`PUT ke R2 gagal (HTTP ${res.status}).`);
+                }
+                log(`TAHAP PUT: selesai — HTTP ${res.status} dalam ${ms} ms (${(file.size / 1048576 / (ms / 1000)).toFixed(2)} MB/s)`);
+            }
+
+            async function runFeTarget() {
+                const { iterations, file } = readParams();
+                const payloadMb = file.size / (1024 * 1024);
+                const keys = [];
+
+                log('=== Benchmark FE (R2 langsung dari browser) dimulai ===', {
+                    file: file.name,
+                    ukuran: fmtSize(file.size),
+                    tipeMenurutBrowser: file.type || '(kosong — fallback application/octet-stream)',
+                    lastModified: new Date(file.lastModified).toISOString(),
+                    putaran: iterations,
+                });
+
+                const oneIteration = async (label) => {
+                    const t0 = performance.now();
+                    const p = await presign(file);
+                    await putToR2(p.url, p.contentType, file);
+                    keys.push(p.key);
+                    const dur = performance.now() - t0;
+                    log(`TAHAP ${label}: total ${dur.toFixed(0)} ms`);
+                    return dur;
+                };
+
+                status.textContent = 'Warmup…';
+                log('TAHAP warmup: dimulai (DNS/TLS/CORS preflight — tidak dihitung)');
+                await oneIteration('warmup');
+
+                const samples = [];
+                for (let i = 1; i <= iterations; i++) {
+                    status.textContent = `Putaran ${i}/${iterations}…`;
+                    log(`TAHAP putaran ${i}/${iterations}: dimulai`);
+                    samples.push(await oneIteration(`putaran ${i}`));
+                }
+
+                const ordered = [...samples].sort((a, b) => a - b);
+                const median = ordered.length % 2
+                    ? ordered[(ordered.length - 1) / 2]
+                    : (ordered[ordered.length / 2 - 1] + ordered[ordered.length / 2]) / 2;
+                const totalSec = samples.reduce((a, b) => a + b, 0) / 1000;
+
+                const stats = {
+                    target: 'Cloudflare R2 — langsung dari browser (FE)',
+                    success: samples.length,
+                    failed: 0,
+                    firstError: null,
+                    minMs: ordered[0],
+                    avgMs: samples.reduce((a, b) => a + b, 0) / samples.length,
+                    medianMs: median,
+                    maxMs: ordered[ordered.length - 1],
+                    totalSeconds: totalSec,
+                    throughputMBps: totalSec > 0 ? (payloadMb * samples.length) / totalSec : 0,
+                };
+                log('TAHAP hitung statistik:', {
+                    min: fmtMs(stats.minMs), rata: fmtMs(stats.avgMs), median: fmtMs(stats.medianMs),
+                    maks: fmtMs(stats.maxMs), total: fmtPlain(stats.totalSeconds, 's', 2),
+                    throughput: fmtPlain(stats.throughputMBps, 'MB/s', 2),
+                });
+                renderRow(stats, true);
+
+                status.textContent = 'Membersihkan file benchmark…';
+                log(`TAHAP cleanup: menghapus ${keys.length} object benchmark di R2…`);
+                await fetchJson('@Url.Action("CleanupFe", "Benchmark")', keys);
+                log('TAHAP cleanup: selesai.');
+                log('=== Benchmark FE selesai ===');
+            }
+
+            // ==================== Wiring ====================
+
+            buttons.forEach((btn) => btn.addEventListener('click', async () => {
+                if (running) return;
+                const target = btn.dataset.target;
+                const { iterations, file } = readParams();
+
+                if (!file) {
+                    errorBox.textContent = 'Pilih file yang ingin dibenchmark terlebih dahulu.';
+                    return;
+                }
+
+                // Total data yang lewat bisa sangat besar (file × putaran) — konfirmasi dulu.
+                const totalBytes = file.size * iterations;
+                if (totalBytes > 1073741824 &&
+                    !confirm(`Total data yang akan di-transfer ± ${fmtSize(totalBytes)} (${file.name} × ${iterations}). Lanjutkan?`)) {
+                    return;
+                }
+
+                errorBox.textContent = '';
+                log('Benchmark dimulai:', {
+                    target: LABELS[target],
+                    file: file.name,
+                    ukuran: fmtSize(file.size),
+                    tipeMenurutBrowser: file.type || '(kosong)',
+                    putaran: iterations,
+                });
+                setRunning(true, `Menjalankan benchmark ${LABELS[target]} — "${file.name}" (${fmtSize(file.size)}) × ${iterations} putaran…`);
+                try {
+                    if (target === 'fe') await runFeTarget();
+                    else await runServerTarget(target);
+                    setRunning(false, `✅ Selesai — "${file.name}" diupload ${iterations}× ke ${LABELS[target]}.`);
+                } catch (err) {
+                    logErr('Benchmark GAGAL:', err);
+                    setRunning(false, '');
+                    errorBox.textContent = err.message;
+                }
+            }));
+        })();
+    </script>
+}
